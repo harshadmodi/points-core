@@ -7,15 +7,57 @@ use std::arch::x86::*;
 use std::arch::x86_64::*;
 
 use std::fmt::{self, Formatter, Display};
+use std::ops::{Add, Sub, Mul};
+
+use super::helper;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Vec3 (__m128);
 
-macro_rules! _mm_shuffle {
-    ($z:expr, $y:expr, $x:expr, $w:expr) => {
-        ($z << 6) | ($y << 4) | ($x << 2) | $w
-    };
+
+
+impl Add for Vec3 {
+    type Output = Self;
+
+    fn add(self, v: Self) -> Self {
+        let mut num: __m128;
+
+        unsafe {
+            num = _mm_add_ps(self.0, v.0); 
+        }
+
+        Self(num)
+    }
 }
+
+impl Sub for Vec3 {
+    type Output = Self;
+
+    fn sub(self, v: Self) -> Self {
+        let mut num: __m128;
+
+        unsafe {
+            num = _mm_sub_ps(self.0, v.0); 
+        }
+
+        Self(num)
+    }
+}
+
+impl Mul for Vec3 {
+    type Output = Self;
+
+    fn mul(self, v: Self) -> Self {
+        let mut num: __m128;
+
+        unsafe {
+            num = _mm_mul_ps(self.0, v.0); 
+        }
+
+        Self(num)
+    }
+}
+
 
 impl Display for Vec3 {
     // `f` is a buffer, and this method must write the formatted string into it.
@@ -32,6 +74,112 @@ impl Vec3 {
             Vec3(_mm_set_ps(0.0, z, y, x)) 
         }
     }
+
+    pub fn transpose(rows: [Self;3]) -> [Self;3] {
+        let mut temp_row: __m128 = Self::new(0.0, 0.0, 0.0).0;
+        let mut row1 = rows[0].0;
+        let mut row2 = rows[1].0;
+        let mut row3 = rows[2].0;
+        unsafe {
+            _MM_TRANSPOSE4_PS(&mut row1, &mut row2, &mut row3, &mut temp_row); 
+        }
+
+        [Self(row1), Self(row2), Self(row3)]
+
+    }
+
+    pub fn inverse(rows: [Self;3]) -> [Self;3] {
+
+	    // use block matrix method
+	    // A is a matrix, then i(A) or iA means inverse of A, A# (or A_ in code) means adjugate of A, |A| (or detA in code) is determinant, tr(A) is trace
+        // ref : https://www.youtube.com/watch?v=3nMwFZbjfgw
+        // https://lxjk.github.io/2017/09/03/Fast-4x4-Matrix-Inverse-with-SSE-SIMD-Explained.html
+
+        // sub matrices
+        let mut row0 = rows[0].0;
+        let mut row1 = rows[1].0;
+        let mut row2 = rows[2].0;
+
+        unsafe {
+            let mut temp_row: __m128 = _mm_set_ps(1.0, 0.0, 0.0, 0.0);
+
+
+            let mut A:__m128 = helper::_vec_shuffle_0101!(row0, row1);
+            let mut C:__m128 = helper::_vec_shuffle_2323!(row0, row1);
+
+            let mut B:__m128 = helper::_vec_shuffle_0101!(row2, temp_row);
+            let mut D:__m128 = helper::_vec_shuffle_2323!(row2, temp_row);
+            
+            // determinant as (|A| |C| |B| |D|)
+            let mut detSub: __m128 = _mm_sub_ps(
+                _mm_mul_ps(
+                    helper::_vec_shuffle!(row0, row2, 0,2,0,2), 
+                    helper::_vec_shuffle!(row1, temp_row, 1,3,1,3)
+                ),
+                _mm_mul_ps(
+                    helper::_vec_shuffle!(row0, row2, 1,3,1,3), 
+                    helper::_vec_shuffle!(row1, temp_row, 0,2,0,2)
+                )
+            );
+
+            let detA:__m128 = helper::_vec_swizzle1!(detSub, 0);
+            let detC:__m128 = helper::_vec_swizzle1!(detSub, 1);
+            let detB:__m128 = helper::_vec_swizzle1!(detSub, 2);
+            let detD:__m128 = helper::_vec_swizzle1!(detSub, 3);
+
+
+            // // let iM = 1/|M| * | X  Y |
+            // //                  | Z  W |
+
+            // // D#C
+            let D_C: __m128 = helper::mat2adjmul(D, C);
+            // // A#B
+            let A_B: __m128 = helper::mat2adjmul(A, B);
+            // // X# = |D|A - B(D#C)
+            let mut X_: __m128 = _mm_sub_ps(_mm_mul_ps(detD, A), helper::mat2mul(B, D_C));
+            // // W# = |A|D - C(A#B)
+            let mut W_: __m128 = _mm_sub_ps(_mm_mul_ps(detA, D), helper::mat2mul(C, A_B));
+
+            // // |M| = |A|*|D| + ... (continue later)
+            let mut detM: __m128 = _mm_mul_ps(detA, detD);
+
+            // // Y# = |B|C - D(A#B)#
+            let mut Y_: __m128 = _mm_sub_ps(_mm_mul_ps(detB, C), helper::mat2muladj(D, A_B));
+            // // Z# = |C|B - A(D#C)#
+            let mut Z_: __m128 = _mm_sub_ps(_mm_mul_ps(detC, B), helper::mat2muladj(A, D_C));
+
+            // // |M| = |A|*|D| + |B|*|C| ... (continue later)
+            let mut detM: __m128 = _mm_add_ps(detM, _mm_mul_ps(detB, detC));
+
+            // // tr((A#B)(D#C))
+            let mut tr: __m128 = _mm_mul_ps(A_B, helper::_vec_swizzle!(D_C, 0,2,1,3));
+            tr = _mm_hadd_ps(tr, tr);
+            tr = _mm_hadd_ps(tr, tr);
+            // // |M| = |A|*|D| + |B|*|C| - tr((A#B)(D#C))
+            detM = _mm_sub_ps(detM, tr);
+
+            let adjSignMask: __m128 = _mm_setr_ps(1.0, -1.0, -1.0, 1.0);
+            // // (1/|M|, -1/|M|, -1/|M|, 1/|M|)
+            let rDetM: __m128 = _mm_div_ps(adjSignMask, detM);
+
+            X_ = _mm_mul_ps(X_, rDetM);
+            Y_ = _mm_mul_ps(Y_, rDetM);
+            Z_ = _mm_mul_ps(Z_, rDetM);
+            W_ = _mm_mul_ps(W_, rDetM);
+
+	
+
+	        // // apply adjugate and store, here we combine adjugate shuffle and store shuffle
+	        let inv0: __m128 = helper::_vec_shuffle!(X_, Z_, 3,1,3,1);
+	        let inv1: __m128 = helper::_vec_shuffle!(X_, Z_, 2,0,2,0);
+	        let inv2: __m128 = helper::_vec_shuffle!(Y_, W_, 3,1,3,1);
+	        let inv3: __m128 = helper::_vec_shuffle!(Y_, W_, 2,0,2,0);
+
+            [Self(inv0), Self(inv1), Self(inv2)]
+
+        }
+    }
+    
     /// Calculate dot product.
     pub fn dot(self, v: Self) -> f32 {
         //  Example :
@@ -106,7 +254,7 @@ impl Vec3 {
 
         */
         
-        unsafe { _mm_cvtss_f32(_mm_shuffle_ps(self.0, self.0, _mm_shuffle!(1, 1, 1, 1))) }
+        unsafe { _mm_cvtss_f32(_mm_shuffle_ps(self.0, self.0, helper::_mm_shuffle!(1, 1, 1, 1))) }
     }
 
     pub fn z(self) -> f32 {
@@ -124,7 +272,7 @@ impl Vec3 {
 
         mask = [2, 2, 2, 2]
         */
-        unsafe { _mm_cvtss_f32(_mm_shuffle_ps(self.0, self.0, _mm_shuffle!(2, 2, 2, 2))) }
+        unsafe { _mm_cvtss_f32(_mm_shuffle_ps(self.0, self.0, helper::_mm_shuffle!(2, 2, 2, 2))) }
     }
 
     pub fn cross(self, v: Self) -> Self {
@@ -173,11 +321,11 @@ impl Vec3 {
 
         unsafe {
             
-            tmp0 = _mm_shuffle_ps(self.0, self.0, _mm_shuffle!(3, 0, 2, 1));
-            tmp1 = _mm_shuffle_ps(v.0, v.0, _mm_shuffle!(3, 1, 0, 2));
+            tmp0 = _mm_shuffle_ps(self.0, self.0, helper::_mm_shuffle!(3, 0, 2, 1));
+            tmp1 = _mm_shuffle_ps(v.0, v.0, helper::_mm_shuffle!(3, 1, 0, 2));
 
-            tmp2 = _mm_shuffle_ps(self.0, self.0, _mm_shuffle!(3, 1, 0, 2));
-            tmp3 = _mm_shuffle_ps(v.0, v.0, _mm_shuffle!(3, 0, 2, 1));
+            tmp2 = _mm_shuffle_ps(self.0, self.0, helper::_mm_shuffle!(3, 1, 0, 2));
+            tmp3 = _mm_shuffle_ps(v.0, v.0, helper::_mm_shuffle!(3, 0, 2, 1));
 
             res = _mm_sub_ps(_mm_mul_ps(tmp0, tmp1), _mm_mul_ps(tmp2, tmp3));
         }
